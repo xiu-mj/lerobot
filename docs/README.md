@@ -1,139 +1,152 @@
-<!---
-Copyright 2020 The HuggingFace Team. All rights reserved.
+# 文档生成指南
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+版权所有 2020 HuggingFace 团队。保留所有权利。
+
+根据 Apache 许可证 2.0（以下简称「许可证」）授权；
+除非遵守许可证，否则你不得使用此文件。
+你可以在以下地址获取许可证副本：
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
+除非适用法律要求或书面同意，根据许可证分发的软件
+按「**原样**」提供，
+**不提供任何明示或暗示的担保或条件**。
+详见许可证，了解具体的权限和
+限制条款。
 
-# Generating the documentation
+---
 
-To generate the documentation, you first have to build it. Several packages are necessary to build the doc,
-you can install them with the following command, at the root of the code repository:
+# 文档生成
+
+想要生成文档，首先需要进行构建。构建文档需要多个依赖包，
+你可以在代码仓库根目录执行以下命令进行安装：
 
 ```bash
 pip install -e . -r docs-requirements.txt
 ```
 
-You will also need `nodejs`. Please refer to their [installation page](https://nodejs.org/en/download)
+同时还需要安装 `nodejs`，请参考其[安装页面](https://nodejs.org/en/download)。
 
 ---
 
-**NOTE**
+**注意**
 
-You only need to generate the documentation to inspect it locally (if you're planning changes and want to
-check how they look before committing for instance). You don't have to `git commit` the built documentation.
+仅当你需要**本地预览文档**时（例如修改内容后想查看效果再提交），才需要生成文档。
+**不需要将构建后的文档文件提交到 Git。**
 
 ---
 
-## Building the documentation
+## 构建文档
 
-Once you have setup the `doc-builder` and additional packages, you can generate the documentation by
-typing the following command:
+安装好 `doc-builder` 与其他依赖包后，执行以下命令即可生成文档：
 
 ```bash
 doc-builder build lerobot docs/source/ --build_dir ~/tmp/test-build
 ```
 
-You can adapt the `--build_dir` to set any temporary folder that you prefer. This command will create it and generate
-the MDX files that will be rendered as the documentation on the main website. You can inspect them in your favorite
-Markdown editor.
+你可以修改 `--build_dir` 指定任意临时目录。该命令会创建目录并生成 MDX 文件，
+这些文件会在官网渲染为文档页面，可使用任意 Markdown 编辑器查看。
 
-## Previewing the documentation
+## 预览文档
 
-To preview the docs, first install the `watchdog` module with:
+如需本地预览，先安装 `watchdog`：
 
 ```bash
 pip install watchdog
 ```
 
-Then run the following command:
+然后运行：
 
 ```bash
 doc-builder preview lerobot docs/source/
 ```
 
-The docs will be viewable at [http://localhost:3000](http://localhost:3000). You can also preview the docs once you have opened a PR. You will see a bot add a comment to a link where the documentation with your changes lives.
+预览地址：[http://localhost:3000](http://localhost:3000)。
+提交 PR 后也可预览：机器人会自动添加评论，提供包含你修改的文档预览链接。
 
 ---
 
-**NOTE**
+**注意**
 
-The `preview` command only works with existing doc files. When you add a completely new file, you need to update `_toctree.yml` & restart `preview` command (`ctrl-c` to stop it & call `doc-builder preview ...` again).
+`preview` 命令仅对**已存在**的文档文件生效。
+新增文件时，需要先更新 `_toctree.yml`，再重启预览命令（`ctrl-c` 停止后重新执行）。
 
 ---
 
-## Adding a new element to the navigation bar
+## 在导航栏添加新条目
 
-Accepted files are Markdown (.md).
+支持文件格式：Markdown（`.md`）。
 
-Create a file with its extension and put it in the source directory. You can then link it to the toc-tree by putting
-the filename without the extension in the [`_toctree.yml`](https://github.com/huggingface/lerobot/blob/main/docs/source/_toctree.yml) file.
+在 `source` 目录下新建对应文件，然后在 [`_toctree.yml`](https://github.com/huggingface/lerobot/main/docs/source/_toctree.yml) 中
+填入**不带后缀**的文件名，即可加入导航目录。
 
-## Renaming section headers and moving sections
+## 重命名章节标题或移动章节
 
-It helps to keep the old links working when renaming the section header and/or moving sections from one document to another. This is because the old links are likely to be used in Issues, Forums, and Social media and it'd make for a much more superior user experience if users reading those months later could still easily navigate to the originally intended information.
+重命名章节、移动章节时，建议保留旧链接可用。
+因为旧链接可能已被 Issue、论坛、社交媒体引用，保留跳转能大幅提升用户体验。
 
-Therefore, we simply keep a little map of moved sections at the end of the document where the original section was. The key is to preserve the original anchor.
+做法：在原章节所在文档末尾保留一个**跳转映射**，关键是**保留原锚点**。
 
-So if you renamed a section from: "Section A" to "Section B", then you can add at the end of the file:
+例如：章节从「Section A」改名为「Section B」，在文件末尾添加：
 
 ```
-Sections that were moved:
+已移动的章节：
 
 [ <a href="#section-b">Section A</a><a id="section-a"></a> ]
 ```
 
-and of course, if you moved it to another file, then:
+如果移动到其他文件：
 
 ```
-Sections that were moved:
+已移动的章节：
 
 [ <a href="../new-file#section-b">Section A</a><a id="section-a"></a> ]
 ```
 
-Use the relative style to link to the new file so that the versioned docs continue to work.
+使用**相对路径**链接，保证多版本文档正常工作。
 
-For an example of a rich moved sections set please see the very end of [the transformers Trainer doc](https://github.com/huggingface/transformers/blob/main/docs/source/en/main_classes/trainer.md).
+完整示例可参考：[transformers Trainer 文档末尾](https://github.com/huggingface/transformers/blob/main/docs/source/en/main_classes/trainer.md)。
 
-### Adding a new tutorial
+### 添加新教程
 
-Adding a new tutorial or section is done in two steps:
+新增教程或章节分两步：
 
-- Add a new file under `./source`. This file can either be ReStructuredText (.rst) or Markdown (.md).
-- Link that file in `./source/_toctree.yml` on the correct toc-tree.
+1. 在 `./source` 下新建文件，格式可为 ReStructuredText（`.rst`）或 Markdown（`.md`）。
+2. 在 `./source/_toctree.yml` 的对应位置添加该文件路径。
 
-Make sure to put your new file under the proper section. If you have a doubt, feel free to ask in a Github Issue or PR.
+请放在合适的章节下，如有疑问可在 GitHub Issue 或 PR 中询问。
 
-### Writing source documentation
+### 编写文档内容
 
-Values that should be put in `code` should either be surrounded by backticks: \`like so\`. Note that argument names
-and objects like True, None or any strings should usually be put in `code`.
+需要以代码格式显示的内容用反引号包裹：\`like so\`。
+参数名、`True`、`None`、字符串等通常都需要用代码格式标注。
 
-#### Writing a multi-line code block
+#### 多行代码块
 
-Multi-line code blocks can be useful for displaying examples. They are done between two lines of three backticks as usual in Markdown:
+多行代码块使用 Markdown 标准的三个反引号：
 
 ````
 ```
-# first line of code
-# second line
-# etc
+# 第一行代码
+# 第二行代码
+# 以此类推
 ```
 ````
 
-#### Adding an image
+#### 插入图片
 
-Due to the rapidly growing repository, it is important to make sure that no files that would significantly weigh down the repository are added. This includes images, videos, and other non-text files. We prefer to leverage a hf.co hosted `dataset` like
-the ones hosted on [`hf-internal-testing`](https://huggingface.co/hf-internal-testing) in which to place these files and reference
-them by URL. We recommend putting them in the following dataset: [huggingface/documentation-images](https://huggingface.co/datasets/huggingface/documentation-images).
-If an external contribution, feel free to add the images to your PR and ask a Hugging Face member to migrate your images
-to this dataset.
+仓库体积增长较快，**禁止直接添加大体积文件**（图片、视频等非文本文件）。
+推荐上传到 Hugging Face 托管的数据集，通过 URL 引用。
+
+建议使用官方数据集：[huggingface/documentation-images](https://huggingface.co/datasets/huggingface/documentation-images)。
+
+外部贡献者可先将图片放到 PR 里，再请 Hugging Face 成员迁移至该数据集。
+
+---
+
+### 术语简明对照
+- **doc-builder**: Hugging Face 专用文档构建工具
+- **PR (Pull Request)**: 代码合并请求
+- **MDX**: 支持 JSX 组件的增强版 Markdown
+- **toctree**: 文档目录树（导航结构）
+- **anchor**: 页面内锚点（# 后面的部分）

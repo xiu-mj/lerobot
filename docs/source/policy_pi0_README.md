@@ -1,48 +1,43 @@
 # π₀ (pi0)
-
-This repository contains the Hugging Face port of **π₀**, adapted from [OpenPI](https://github.com/Physical-Intelligence/openpi) by the Physical Intelligence.
-It is designed as a **Vision-Language-Action model for general robot control**.
-
----
-
-## Model Overview
-
-| Feature              | π₀                                                     | π₀.₅                                      |
-| -------------------- | ------------------------------------------------------ | ----------------------------------------- |
-| Time Conditioning    | Concatenates time with actions via `action_time_mlp_*` | Uses `time_mlp_*` for AdaRMS conditioning |
-| AdaRMS               | Not used                                               | Used in action expert                     |
-| Tokenizer Length     | 48 tokens                                              | 200 tokens                                |
-| Discrete State Input | False (Uses `state_proj` layer)                        | True                                      |
-| Parameter Count      | Higher (includes state embedding)                      | Lower (no state embedding)                |
+本仓库是 **π₀** 模型在 Hugging Face 平台的移植版本，基于 Physical Intelligence 团队的 [OpenPI](https://github.com/Physical-Intelligence/openpi) 项目适配开发。
+该模型是一款用于**通用机器人控制的视觉-语言-动作（VLA）模型**。
 
 ---
 
-## Relative Actions
+## 模型概览
 
-π₀ supports training with **relative actions**, where the model learns relative offsets
-from the current robot state instead of absolute joint positions. This mirrors the
-relative-action transform in OpenPI (`DeltaActions`) and can improve performance.
+| 特性 | π₀ | π₀.₅ |
+| ---- | ------------------------------------------------------ | ----------------------------------------- |
+| 时间条件编码 | 通过 `action_time_mlp_*` 将时间与动作拼接 | 使用 `time_mlp_*` 实现 AdaRMS 条件编码 |
+| AdaRMS 归一化 | 未使用 | 在动作专家模块中启用 |
+| 分词器长度 | 48 个令牌 | 200 个令牌 |
+| 离散状态输入 | 否（使用 `state_proj` 层） | 是 |
+| 参数规模 | 更大（包含状态嵌入层） | 更小（无状态嵌入层） |
 
-### How it works
+---
 
-1. **During preprocessing**, absolute actions are converted to relative offsets:
-   `relative = action - state` (for selected joints).
-2. The relative actions are normalized using statistics computed from the relative distribution.
-3. **During postprocessing**, predicted relative actions are converted back to absolute:
-   `absolute = relative + state`.
+## 相对动作
+π₀ 支持**相对动作**训练：模型学习机器人当前状态的**相对偏移量**，而非绝对关节坐标。
+该机制与 OpenPI 中的 `DeltaActions` 相对动作变换一致，可有效提升模型性能。
 
-Joints listed in `relative_exclude_joints` (e.g., gripper) are kept absolute.
+### 工作原理
+1. **预处理阶段**：将绝对动作转换为相对偏移量
+   `相对值 = 动作值 - 状态值`（针对指定关节）
+2. 基于相对动作的分布统计数据进行归一化
+3. **后处理阶段**：将预测的相对动作还原为绝对动作
+   `绝对值 = 相对值 + 状态值`
 
-### Configuration
+在 `relative_exclude_joints` 中指定的关节（如夹爪）将**保持绝对动作**，不参与相对转换。
 
-| Parameter                 | Type        | Default       | Description                                                      |
+### 配置参数
+
+| 参数名称 | 类型 | 默认值 | 说明 |
 | ------------------------- | ----------- | ------------- | ---------------------------------------------------------------- |
-| `use_relative_actions`    | `bool`      | `False`       | Enable relative-action training                                  |
-| `relative_exclude_joints` | `list[str]` | `["gripper"]` | Joint names to keep absolute (matched by substring)              |
-| `action_feature_names`    | `list[str]` | `None`        | Auto-populated from dataset metadata at runtime by `make_policy` |
+| `use_relative_actions` | `布尔值` | `False` | 启用相对动作训练 |
+| `relative_exclude_joints` | `字符串列表` | `["gripper"]` | 保持绝对动作的关节名称（子串匹配） |
+| `action_feature_names` | `字符串列表` | `None` | 运行时由 `make_policy` 自动从数据集元数据填充 |
 
-### Training example
-
+### 训练示例
 ```bash
 python -m lerobot.scripts.lerobot_train \
   --policy.type=pi0 \
@@ -51,16 +46,13 @@ python -m lerobot.scripts.lerobot_train \
   --policy.relative_exclude_joints='["gripper"]'
 ```
 
-When `use_relative_actions=true`, the training script automatically:
+启用 `use_relative_actions=true` 后，训练脚本会**自动完成以下操作**：
+- 从数据集中计算相对动作统计量（分块采样的相对动作）
+- 用相对动作统计量替换标准动作统计量，用于归一化
+- 在分布式训练中，将统计量同步到所有计算节点
 
-- Computes relative action statistics from the dataset (sampled chunk-level relative actions)
-- Replaces the standard action stats with relative stats for normalization
-- Broadcasts these stats across all ranks in distributed training
-
-### Recomputing stats for an existing dataset
-
-If you want to precompute relative action stats offline, use `recompute_stats` from
-`lerobot.datasets`:
+### 为现有数据集重新计算统计量
+如需离线预计算相对动作统计量，可使用 `lerobot.datasets` 中的 `recompute_stats` 工具：
 
 ```python
 from lerobot.datasets import LeRobotDataset, recompute_stats
@@ -75,9 +67,8 @@ dataset = recompute_stats(
 
 ---
 
-## Citation
-
-If you use this work, please cite both **OpenPI** and the π₀ paper:
+## 引用说明
+如果你使用了本项目，请同时引用 **OpenPI** 与 π₀ 论文：
 
 ```bibtex
 @misc{openpi2024,
@@ -102,6 +93,16 @@ If you use this work, please cite both **OpenPI** and the π₀ paper:
 
 ---
 
-## License
+## 许可证
+本移植版本遵循 **Apache 2.0 开源许可证**，与原始 [OpenPI 仓库](https://github.com/Physical-Intelligence/openpi) 保持一致。
 
-This port follows the **Apache 2.0 License**, consistent with the original [OpenPI repository](https://github.com/Physical-Intelligence/openpi).
+---
+
+### 专业术语对照
+- **Vision-Language-Action (VLA)**: 视觉-语言-动作（机器人多模态模型）
+- **Relative Actions**: 相对动作
+- **Absolute Actions**: 绝对动作
+- **AdaRMS**: 自适应均方根归一化（深度学习优化技术）
+- **State Embedding**: 状态嵌入
+- **Joint**: 机器人关节
+- **Gripper**: 机器人夹爪/执行器

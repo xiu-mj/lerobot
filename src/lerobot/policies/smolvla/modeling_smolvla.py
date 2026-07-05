@@ -831,11 +831,18 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
-        num_steps = self.config.num_steps
-        dt = -1.0 / num_steps
+        # Determine step budget (adaptive or fixed)
+        adaptive_cfg = self.config.adaptive_config
+        use_adaptive = adaptive_cfg is not None and adaptive_cfg.enabled
+        max_steps = adaptive_cfg.max_steps if use_adaptive else self.config.num_inference_steps
+        min_steps = adaptive_cfg.min_steps if use_adaptive else max_steps
+
+        dt = -1.0 / max_steps
 
         x_t = noise
-        for step in range(num_steps):
+        prev_x_t = None
+        stable_count = 0
+        for step in range(max_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
@@ -864,6 +871,18 @@ class VLAFlowMatching(nn.Module):
                 v_t = denoise_step_partial_call(x_t)
 
             x_t = x_t + dt * v_t
+
+            # Adaptive convergence check
+            if use_adaptive and step >= min_steps - 1:
+                if prev_x_t is not None:
+                    rel_change = (x_t - prev_x_t).norm() / (prev_x_t.norm() + 1e-8)
+                    if rel_change < adaptive_cfg.rel_threshold:
+                        stable_count += 1
+                        if stable_count >= adaptive_cfg.patience:
+                            break
+                    else:
+                        stable_count = 0
+                prev_x_t = x_t.clone()
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)

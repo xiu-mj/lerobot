@@ -18,6 +18,7 @@ from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTr
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import OBS_IMAGES
 
+from ..adaptive.configuration_adaptive import AdaptiveInferenceConfig
 from ..rtc.configuration_rtc import RTCConfig
 
 
@@ -60,7 +61,25 @@ class SmolVLAConfig(PreTrainedConfig):
     tokenizer_max_length: int = 48
 
     # Decoding
-    num_steps: int = 10
+    num_steps: int = 10  # training ODE steps (for backward compat)
+    num_inference_steps: int = 10  # inference ODE steps (reflow后可降到2-4)
+
+    # ---- Rectified Flow / Reflow ----
+    time_distribution: str = "beta"
+    time_beta_alpha: float = 1.5
+    time_beta_beta: float = 1.0
+    time_logit_scale: float = 1.0
+    rectified_flow_stage: int = 1
+    use_reflow_pairs: bool = False
+    reflow_pairs_path: str | None = None
+
+    # ---- DiT Action Head ----
+    dit_hidden_dim: int = 384
+    dit_num_layers: int = 4
+    dit_num_heads: int = 6
+    dit_mlp_ratio: float = 4.0
+    dit_dropout: float = 0.0
+    dit_logit_normal_scale: float | None = None
 
     # Attention utils
     use_cache: bool = True
@@ -103,6 +122,9 @@ class SmolVLAConfig(PreTrainedConfig):
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 
+    # Adaptive inference step selection
+    adaptive_config: AdaptiveInferenceConfig | None = None
+
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 
@@ -110,6 +132,13 @@ class SmolVLAConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        valid_time_dist = ("beta", "uniform", "u_shaped", "logit_normal")
+        if self.time_distribution not in valid_time_dist:
+            raise ValueError(f"time_distribution must be one of {valid_time_dist}, got '{self.time_distribution}'")
+        if self.num_inference_steps > self.num_steps:
+            raise ValueError(
+                f"num_inference_steps ({self.num_inference_steps}) must be <= num_steps ({self.num_steps})"
+            )
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "

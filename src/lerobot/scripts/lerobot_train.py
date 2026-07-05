@@ -21,6 +21,7 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 import dataclasses
 import logging
 import time
+from pathlib import Path
 from contextlib import nullcontext
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
@@ -258,6 +259,20 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # Convert CLI peft config to dict for overrides
         peft_cli_overrides = dataclasses.asdict(cfg.peft)
         policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
+
+    if getattr(cfg.policy, "use_reflow_pairs", False) and is_main_process:
+        if cfg.policy.reflow_pairs_path:
+            reflow_path = Path(cfg.policy.reflow_pairs_path)
+        else:
+            reflow_path = Path(cfg.policy.pretrained_path).parent / "reflow_pairs.pt"
+        if reflow_path.exists():
+            logging.info(f"Loading reflow pairs from {reflow_path}")
+            policy.load_reflow_pairs(reflow_path)
+        else:
+            raise FileNotFoundError(
+                f"use_reflow_pairs=True but no reflow_pairs.pt found at {reflow_path}. "
+                f"Run lerobot-reflow first to generate reflow pairs."
+            )
 
     # Wait for all processes to finish policy creation before continuing
     accelerator.wait_for_everyone()
