@@ -122,6 +122,7 @@ class RTCProcessor:
         time,
         original_denoise_step_partial,
         execution_horizon=None,
+        endpoint_prediction_fn=None,
     ) -> Tensor:
         """RTC guidance wrapper around an existing denoiser.
 
@@ -141,6 +142,10 @@ class RTCProcessor:
                 computes the base denoised velocity given only ``x_t``.
             execution_horizon (int | None): Horizon used to build prefix weights. If
                 ``None``, defaults to ``self.rtc_config.execution_horizon``.
+            endpoint_prediction_fn (Callable | None): Optional function mapping
+                ``(x_t, v_t, time)`` to the denoised action endpoint. Policies with a
+                different flow time convention can override the default
+                ``x_t - time * v_t`` formula.
 
         Returns:
             Tensor: Guided velocity with the same shape as ``v_t``.
@@ -213,7 +218,10 @@ class RTCProcessor:
             v_t = original_denoise_step_partial(x_t)
             x_t.requires_grad_(True)
 
-            x1_t = x_t - time * v_t  # noqa: N806
+            if endpoint_prediction_fn is None:
+                x1_t = x_t - time * v_t  # noqa: N806
+            else:
+                x1_t = endpoint_prediction_fn(x_t, v_t, time)  # noqa: N806
             err = (prev_chunk_left_over - x1_t) * weights
             grad_outputs = err.clone().detach()
             correction = torch.autograd.grad(x1_t, x_t, grad_outputs, retain_graph=False)[0]

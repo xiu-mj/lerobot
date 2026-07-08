@@ -2,6 +2,12 @@
 
 https://arxiv.org/abs/2506.01844
 
+## Rectified Flow Variant
+
+This fork includes a configurable Rectified Flow objective for SmolVLA. See
+[`smolvla_rectified_flow_runbook.md`](./smolvla_rectified_flow_runbook.md) for training,
+evaluation, and server-sync commands.
+
 ## Citation
 
 ```bibtex

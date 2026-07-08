@@ -538,6 +538,39 @@ def pad_tensor(tensor, max_len, pad_value=0):
     return padded_tensor
 
 
+def sample_flow_time(
+    bsize: int,
+    device: torch.device | str,
+    sampling: str,
+    beta_alpha: float,
+    beta_beta: float,
+    eps: float,
+) -> Tensor:
+    if sampling == "uniform":
+        time = torch.rand((bsize,), device=device, dtype=torch.float32)
+    elif sampling == "beta":
+        beta_dist = torch.distributions.Beta(concentration1=beta_alpha, concentration0=beta_beta)
+        time = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
+    else:
+        raise ValueError(f"Unsupported flow time sampling strategy: {sampling!r}")
+
+    return time * (1 - 2 * eps) + eps
+
+
+def flow_training_path(actions: Tensor, noise: Tensor, time: Tensor, objective: str) -> tuple[Tensor, Tensor]:
+    time_expanded = time[:, None, None]
+    if objective == "rectified_flow":
+        x_t = (1 - time_expanded) * noise + time_expanded * actions
+        u_t = actions - noise
+    elif objective == "flow_matching":
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+    else:
+        raise ValueError(f"Unsupported flow objective: {objective!r}")
+
+    return x_t, u_t
+
+
 class VLAFlowMatching(nn.Module):
     """
     SmolVLA
@@ -629,10 +662,14 @@ class VLAFlowMatching(nn.Module):
         return noise
 
     def sample_time(self, bsize, device):
-        beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)
-        time_beta = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
-        time = time_beta * 0.999 + 0.001
-        return time
+        return sample_flow_time(
+            bsize=bsize,
+            device=device,
+            sampling=self.config.flow_time_sampling,
+            beta_alpha=self.config.flow_time_beta_alpha,
+            beta_beta=self.config.flow_time_beta_beta,
+            eps=self.config.flow_time_eps,
+        )
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
@@ -781,9 +818,7 @@ class VLAFlowMatching(nn.Module):
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        x_t, u_t = flow_training_path(actions, noise, time, self.config.flow_objective)
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
@@ -842,11 +877,16 @@ class VLAFlowMatching(nn.Module):
             fill_kv_cache=True,
         )
         num_steps = self.config.num_steps
-        dt = -1.0 / num_steps
+        if self.config.flow_objective == "rectified_flow":
+            start_time = 0.0
+            dt = 1.0 / num_steps
+        else:
+            start_time = 1.0
+            dt = -1.0 / num_steps
 
         x_t = noise
         for step in range(num_steps):
-            time = 1.0 + step * dt
+            time = start_time + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
@@ -869,6 +909,7 @@ class VLAFlowMatching(nn.Module):
                     time=time,
                     original_denoise_step_partial=denoise_step_partial_call,
                     execution_horizon=execution_horizon,
+                    endpoint_prediction_fn=self._flow_endpoint_prediction,
                 )
             else:
                 v_t = denoise_step_partial_call(x_t)
@@ -879,6 +920,16 @@ class VLAFlowMatching(nn.Module):
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
         return x_t
+
+    def _flow_endpoint_prediction(self, x_t: Tensor, v_t: Tensor, time: float | Tensor) -> Tensor:
+        time_tensor = torch.as_tensor(time, device=x_t.device, dtype=x_t.dtype)
+        while time_tensor.ndim < x_t.ndim:
+            time_tensor = time_tensor.unsqueeze(-1)
+
+        if self.config.flow_objective == "rectified_flow":
+            return x_t + (1 - time_tensor) * v_t
+
+        return x_t - time_tensor * v_t
 
     def denoise_step(
         self,

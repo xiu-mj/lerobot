@@ -61,6 +61,11 @@ class SmolVLAConfig(PreTrainedConfig):
 
     # Decoding
     num_steps: int = 10
+    flow_objective: str = "rectified_flow"
+    flow_time_sampling: str = "uniform"
+    flow_time_beta_alpha: float = 1.5
+    flow_time_beta_beta: float = 1.0
+    flow_time_eps: float = 1e-3
 
     # Attention utils
     use_cache: bool = True
@@ -119,6 +124,16 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        if self.flow_objective not in {"rectified_flow", "flow_matching"}:
+            raise ValueError(
+                f"`flow_objective` must be 'rectified_flow' or 'flow_matching', got {self.flow_objective!r}."
+            )
+        if self.flow_time_sampling not in {"uniform", "beta"}:
+            raise ValueError(
+                f"`flow_time_sampling` must be 'uniform' or 'beta', got {self.flow_time_sampling!r}."
+            )
+        if not 0 <= self.flow_time_eps < 0.5:
+            raise ValueError(f"`flow_time_eps` must be in [0, 0.5), got {self.flow_time_eps}.")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):
