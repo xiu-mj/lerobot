@@ -1,10 +1,10 @@
-# SmolVLA Rectified Flow 改造运行文档
+# SmolVLA Rectified Flow 运行手册
 
-本文档用于在本地只修改代码，再同步到服务器运行 SmolVLA Rectified Flow 训练/评估。大模型权重不需要从本地同步到服务器。
+这份文档适合你的场景：本地只改代码，然后把代码同步到服务器，在服务器上的 conda 环境里训练和评估。模型权重文件留在服务器，不需要同步回本地。
 
-## 1. 本次代码改动
+## 1. 本次改动
 
-- `policy.flow_objective` 默认改为 `rectified_flow`。
+- `policy.flow_objective` 默认改成了 `rectified_flow`
 - Rectified Flow 训练路径：
   - `x_t = (1 - t) * noise + t * action`
   - `target = action - noise`
@@ -12,42 +12,14 @@
 - Rectified Flow 推理路径：
   - 从 `x_0 = noise` 开始
   - 用 Euler ODE 从 `t=0` 积分到 `t=1`
-  - `policy.num_steps` 控制积分步数，默认仍为 `10`
-- 保留旧实现用于对照实验：
+  - `policy.num_steps` 控制积分步数，默认还是 `10`
+- 保留旧版 flow matching 作为对照：
   - `--policy.flow_objective=flow_matching`
   - `--policy.flow_time_sampling=beta`
 
-## 2. 本地检查
+## 2. 本地提交与同步
 
-Windows 本地如果没有完整训练环境，至少做语法检查：
-
-```bash
-python -m py_compile \
-  src/lerobot/policies/smolvla/configuration_smolvla.py \
-  src/lerobot/policies/smolvla/modeling_smolvla.py \
-  src/lerobot/policies/rtc/modeling_rtc.py \
-  tests/policies/smolvla/test_smolvla_rectified_flow.py
-```
-
-在服务器完整环境中建议运行：
-
-```bash
-uv run pytest tests/policies/smolvla/test_smolvla_rectified_flow.py -q
-```
-
-## 3. 同步代码到服务器
-
-推荐用 `git` 同步代码，不提交模型权重。确认 `.gitignore` 已排除本地权重目录、缓存目录和训练输出目录，例如：
-
-```gitignore
-outputs/
-checkpoints/
-pretrained/
-*.safetensors
-*.bin
-*.pt
-*.pth
-```
+如果你只是想把代码推到 GitHub，然后在服务器拉取，直接走 git 就行。
 
 提交代码：
 
@@ -57,60 +29,72 @@ git add src/lerobot/policies/smolvla/configuration_smolvla.py \
         src/lerobot/policies/smolvla/modeling_smolvla.py \
         src/lerobot/policies/rtc/modeling_rtc.py \
         tests/policies/smolvla/test_smolvla_rectified_flow.py \
-        docs/source/smolvla_rectified_flow_runbook.md
+        docs/source/smolvla_rectified_flow_runbook.md \
+        docs/source/policy_smolvla_README.md
 git commit -m "Add rectified flow objective for SmolVLA"
-git push origin <your-branch>
+git push origin main
 ```
 
-服务器拉取：
+如果你更习惯先拉到服务器再跑，也可以在服务器上执行：
 
 ```bash
 cd /path/to/lerobot
 git fetch origin
-git checkout <your-branch>
-git pull --ff-only
+git checkout main
+git pull --ff-only origin main
 ```
 
-如果不想走远端仓库，也可以用 `rsync`，但要排除大文件：
+## 3. 服务器 conda 环境准备
 
-```bash
-rsync -av --delete \
-  --exclude ".git/" \
-  --exclude "outputs/" \
-  --exclude "checkpoints/" \
-  --exclude "pretrained/" \
-  --exclude "*.safetensors" \
-  --exclude "*.bin" \
-  --exclude "*.pt" \
-  --exclude "*.pth" \
-  ./ user@server:/path/to/lerobot/
-```
-
-## 4. 服务器环境准备
+把下面的 `smolvla` 换成你的环境名。
 
 ```bash
 cd /path/to/lerobot
-uv sync --locked --extra smolvla --extra test --extra dev
+conda activate smolvla
 ```
 
-如果服务器已经安装好依赖和预训练模型，可以只确认当前环境可导入：
+如果这个环境还没装依赖，通常先在环境里执行一次：
 
 ```bash
-uv run python -c "from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig; print(SmolVLAConfig().flow_objective)"
+pip install -e ".[smolvla,test,dev]"
 ```
 
-输出应为：
+检查当前环境能否导入配置：
+
+```bash
+python -c "from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig; print(SmolVLAConfig().flow_objective)"
+```
+
+正常应输出：
 
 ```text
 rectified_flow
 ```
 
-## 5. Rectified Flow 微调命令
+## 4. 语法与单测
 
-从服务器已有的 SmolVLA 预训练权重继续训练：
+先做一个轻量语法检查：
 
 ```bash
-uv run lerobot-train \
+python -m py_compile \
+  src/lerobot/policies/smolvla/configuration_smolvla.py \
+  src/lerobot/policies/smolvla/modeling_smolvla.py \
+  src/lerobot/policies/rtc/modeling_rtc.py \
+  tests/policies/smolvla/test_smolvla_rectified_flow.py
+```
+
+再跑新增单测：
+
+```bash
+python -m pytest tests/policies/smolvla/test_smolvla_rectified_flow.py -q
+```
+
+## 5. Rectified Flow 训练命令
+
+从服务器上的 SmolVLA 预训练权重继续训练：
+
+```bash
+python -m lerobot.scripts.lerobot_train \
   --policy.path=/path/to/server/pretrained/smolvla_base \
   --policy.flow_objective=rectified_flow \
   --policy.flow_time_sampling=uniform \
@@ -122,10 +106,10 @@ uv run lerobot-train \
   --output_dir=outputs/train/smolvla_rf
 ```
 
-如果从配置新建 SmolVLA，而不是从 `policy.path` 读取：
+如果你是从 `--policy.type=smolvla` 新建训练，而不是从已有 checkpoint 续训：
 
 ```bash
-uv run lerobot-train \
+python -m lerobot.scripts.lerobot_train \
   --policy.type=smolvla \
   --policy.load_vlm_weights=true \
   --policy.flow_objective=rectified_flow \
@@ -139,10 +123,10 @@ uv run lerobot-train \
 
 ## 6. 对照实验：旧 Flow Matching
 
-旧行为的关键差异是时间方向相反、目标为 `noise - action`，并使用 Beta 时间采样。用于 ablation：
+如果你想和原版对比，直接切回旧参数：
 
 ```bash
-uv run lerobot-train \
+python -m lerobot.scripts.lerobot_train \
   --policy.path=/path/to/server/pretrained/smolvla_base \
   --policy.flow_objective=flow_matching \
   --policy.flow_time_sampling=beta \
@@ -154,32 +138,32 @@ uv run lerobot-train \
   --output_dir=outputs/train/smolvla_fm_baseline
 ```
 
-## 7. 推理与评估
+## 7. 评估命令
 
-使用训练出的 checkpoint：
+训练完成后，拿最后一个 checkpoint 做评估：
 
 ```bash
-uv run lerobot-eval \
+python -m lerobot.scripts.lerobot_eval \
   --policy.path=outputs/train/smolvla_rf/checkpoints/last/pretrained_model \
   --env.type=<ENV_TYPE> \
   --eval.n_episodes=50
 ```
 
-如果你想测试更少/更多 ODE 步数：
+如果你想看看更少步数是否还能保持效果：
 
 ```bash
-uv run lerobot-eval \
+python -m lerobot.scripts.lerobot_eval \
   --policy.path=outputs/train/smolvla_rf/checkpoints/last/pretrained_model \
   --policy.num_steps=6 \
   --env.type=<ENV_TYPE> \
   --eval.n_episodes=50
 ```
 
-建议先比较 `num_steps=10`、`8`、`6`。Rectified Flow 的目标是让轨迹更直，理想情况下可以用更少步数保持接近效果，但实际取决于数据集和微调时长。
+建议先比较 `num_steps=10`、`8`、`6`。Rectified Flow 的目标是让轨迹更直，很多任务上可以尝试更少步数，但最终还是要看数据集和微调结果。
 
-## 8. 注意事项
+## 8. 需要注意的地方
 
-- 直接把旧 SmolVLA 权重切到 `rectified_flow` 做零样本推理通常不可靠，因为时间 embedding 和速度符号都变了。建议至少做一次微调。
-- 如果要严格复现原始 SmolVLA，请显式加上 `--policy.flow_objective=flow_matching --policy.flow_time_sampling=beta`。
-- 训练输出和预训练权重只放服务器，不纳入 git。
-- 修改后新增的单元测试不依赖 SmolVLA 大权重，适合先在服务器 CI/命令行快速验证。
+- 旧的 SmolVLA 权重直接切到 `rectified_flow` 做零样本推理通常不稳，最好至少微调一下
+- 如果要严格复现原来的行为，就显式加上 `--policy.flow_objective=flow_matching --policy.flow_time_sampling=beta`
+- 训练输出和预训练权重留在服务器，不要纳入 git
+- 我加的单测不依赖大权重，适合先在服务器上快速验证代码没坏

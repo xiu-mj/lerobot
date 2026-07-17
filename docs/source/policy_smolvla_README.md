@@ -6,7 +6,9 @@ https://arxiv.org/abs/2506.01844
 
 This fork includes a configurable Rectified Flow objective for SmolVLA. See
 [`smolvla_rectified_flow_runbook.md`](./smolvla_rectified_flow_runbook.md) for training,
-evaluation, and server-sync commands.
+evaluation, and server-sync commands. See
+[`smolvla_rectified_flow_code_changes.md`](./smolvla_rectified_flow_code_changes.md) for
+the implementation summary.
 
 ## Citation
 
