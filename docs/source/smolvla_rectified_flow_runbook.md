@@ -11,7 +11,8 @@
   - `t ~ Uniform(eps, 1 - eps)`，默认 `eps=1e-3`
 - Rectified Flow 推理路径：
   - 从 `x_0 = noise` 开始
-  - 用 Euler ODE 从 `t=0` 积分到 `t=1`
+  - 从 `t=0` 积分到 `t=1`
+  - `policy.flow_solver` 可选择 `euler`（默认）或 `heun`
   - `policy.num_steps` 控制积分步数，默认还是 `10`
 - 保留旧版 flow matching 作为对照：
   - `--policy.flow_objective=flow_matching`
@@ -159,7 +160,18 @@ python -m lerobot.scripts.lerobot_eval \
   --eval.n_episodes=50
 ```
 
-建议先比较 `num_steps=10`、`8`、`6`。Rectified Flow 的目标是让轨迹更直，很多任务上可以尝试更少步数，但最终还是要看数据集和微调结果。
+已有的 Rectified Flow checkpoint 不需要重新训练，可以直接切换到 Heun：
+
+```bash
+python -m lerobot.scripts.lerobot_eval \
+  --policy.path=outputs/train/smolvla_rf/checkpoints/last/pretrained_model \
+  --policy.flow_solver=heun \
+  --policy.num_steps=4 \
+  --env.type=<ENV_TYPE> \
+  --eval.n_episodes=50
+```
+
+Heun 每一步会调用模型两次，因此相同步数下推理时间和显存临时开销可能增加。公平比较计算量时，建议比较 Euler `num_steps=8` 与 Heun `num_steps=4`，以及 Euler `num_steps=4` 与 Heun `num_steps=2`。首轮实验可跑 Euler `4/8/10` 和 Heun `2/4/5`。
 
 ## 8. 需要注意的地方
 

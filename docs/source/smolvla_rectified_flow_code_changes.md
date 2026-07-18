@@ -1,7 +1,7 @@
 # SmolVLA Rectified Flow Code Changes
 
-This document records the first-stage SmolVLA Rectified Flow modification in this fork.
-It is intended as a compact technical reference before starting the next round of changes.
+This document records the SmolVLA Rectified Flow modification and the subsequent Heun
+inference-solver extension in this fork.
 
 ## Goal
 
@@ -19,7 +19,8 @@ t ~ Uniform(eps, 1 - eps)
 ```
 
 At inference time, sampling starts from Gaussian noise at `t=0` and integrates the learned
-velocity field to `t=1` with Euler steps.
+velocity field to `t=1`. Euler remains the default solver, and Heun is available as a
+second-order predictor-corrector alternative.
 
 ## Modified Files
 
@@ -29,6 +30,7 @@ Added configurable flow settings to `SmolVLAConfig`:
 
 ```python
 flow_objective: str = "rectified_flow"
+flow_solver: str = "euler"
 flow_time_sampling: str = "uniform"
 flow_time_beta_alpha: float = 1.5
 flow_time_beta_beta: float = 1.0
@@ -38,6 +40,7 @@ flow_time_eps: float = 1e-3
 Validation was added for:
 
 - `flow_objective in {"rectified_flow", "flow_matching"}`
+- `flow_solver in {"euler", "heun"}`
 - `flow_time_sampling in {"uniform", "beta"}`
 - `0 <= flow_time_eps < 0.5`
 
@@ -85,6 +88,25 @@ else:
     dt = -1.0 / num_steps
 ```
 
+The inference solver is selected independently of the training objective:
+
+```bash
+--policy.flow_solver=euler  # default, one velocity evaluation per step
+--policy.flow_solver=heun   # predictor-corrector, two evaluations per step
+```
+
+For Heun, each update is:
+
+```text
+v_t = v(x_t, t)
+x_pred = x_t + dt * v_t
+v_next = v(x_pred, t + dt)
+x_next = x_t + dt * (v_t + v_next) / 2
+```
+
+This only changes inference. Existing Rectified Flow checkpoints can be evaluated with
+either solver without retraining or changing checkpoint files.
+
 For Rectified Flow, the final clean action estimate used by RTC is:
 
 ```python
@@ -125,6 +147,9 @@ Added lightweight unit tests for:
 - legacy flow-matching interpolation and target direction
 - time sampling respects epsilon bounds
 - invalid flow objective raises `ValueError`
+- Euler and Heun solver update formulas
+- missing Heun corrector velocity raises `ValueError`
+- invalid solver configuration raises `ValueError`
 
 These tests do not require the large SmolVLA weights.
 
@@ -145,6 +170,18 @@ Rectified Flow:
 --policy.flow_time_sampling=uniform \
 --policy.flow_time_eps=0.001
 ```
+
+Heun evaluation:
+
+```bash
+--policy.flow_objective=rectified_flow \
+--policy.flow_solver=heun \
+--policy.num_steps=4
+```
+
+Because Heun uses two model evaluations per step, compare compute budgets using the number
+of function evaluations (NFE): Euler 8 steps is approximately comparable to Heun 4 steps,
+and Euler 4 steps to Heun 2 steps.
 
 Legacy flow matching baseline:
 
@@ -183,4 +220,4 @@ final-performance replacement for Standard SmolVLA after inference-step tuning.
 2. Run Standard 100k with `num_steps=4/6/8/2`.
 3. Compare `best-s` at the same training budget.
 4. Keep `libero_90` separate from the main 4-suite conclusion because all current scores are near zero.
-
+5. Compare RF Euler and Heun at matched NFE: Euler `4/8/10` against Heun `2/4/5`.

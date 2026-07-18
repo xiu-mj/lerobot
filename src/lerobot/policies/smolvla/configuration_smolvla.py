@@ -61,6 +61,7 @@ class SmolVLAConfig(PreTrainedConfig):
 
     # Decoding
     num_steps: int = 10
+    flow_solver: str = "euler"
     flow_objective: str = "rectified_flow"
     flow_time_sampling: str = "uniform"
     flow_time_beta_alpha: float = 1.5
@@ -128,6 +129,8 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 f"`flow_objective` must be 'rectified_flow' or 'flow_matching', got {self.flow_objective!r}."
             )
+        if self.flow_solver not in {"euler", "heun"}:
+            raise ValueError(f"`flow_solver` must be 'euler' or 'heun', got {self.flow_solver!r}.")
         if self.flow_time_sampling not in {"uniform", "beta"}:
             raise ValueError(
                 f"`flow_time_sampling` must be 'uniform' or 'beta', got {self.flow_time_sampling!r}."

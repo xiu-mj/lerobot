@@ -571,6 +571,25 @@ def flow_training_path(actions: Tensor, noise: Tensor, time: Tensor, objective: 
     return x_t, u_t
 
 
+def flow_solver_step(
+    x_t: Tensor,
+    v_t: Tensor,
+    dt: float,
+    solver: str,
+    v_next: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    if solver == "euler":
+        step_velocity = v_t
+    elif solver == "heun":
+        if v_next is None:
+            raise ValueError("Heun solver requires the velocity at the predicted next state.")
+        step_velocity = 0.5 * (v_t + v_next)
+    else:
+        raise ValueError(f"Unsupported flow solver: {solver!r}")
+
+    return x_t + dt * step_velocity, step_velocity
+
+
 class VLAFlowMatching(nn.Module):
     """
     SmolVLA
@@ -885,25 +904,24 @@ class VLAFlowMatching(nn.Module):
             dt = -1.0 / num_steps
 
         x_t = noise
-        for step in range(num_steps):
-            time = start_time + step * dt
+        inference_delay = kwargs.get("inference_delay")
+        prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+        execution_horizon = kwargs.get("execution_horizon")
+
+        def predict_velocity(input_x_t: Tensor, time: float) -> Tensor:
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
-            def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
+            def denoise_step_partial_call(denoise_input_x_t):
                 return self.denoise_step(
-                    x_t=input_x_t,
+                    x_t=denoise_input_x_t,
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
-                    timestep=current_timestep,
+                    timestep=time_tensor,
                 )
 
             if self._rtc_enabled():
-                inference_delay = kwargs.get("inference_delay")
-                prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
-                execution_horizon = kwargs.get("execution_horizon")
-
-                v_t = self.rtc_processor.denoise_step(
-                    x_t=x_t,
+                return self.rtc_processor.denoise_step(
+                    x_t=input_x_t,
                     prev_chunk_left_over=prev_chunk_left_over,
                     inference_delay=inference_delay,
                     time=time,
@@ -911,13 +929,28 @@ class VLAFlowMatching(nn.Module):
                     execution_horizon=execution_horizon,
                     endpoint_prediction_fn=self._flow_endpoint_prediction,
                 )
-            else:
-                v_t = denoise_step_partial_call(x_t)
+            return denoise_step_partial_call(input_x_t)
 
-            x_t = x_t + dt * v_t
+        for step in range(num_steps):
+            time = start_time + step * dt
+            v_t = predict_velocity(x_t, time)
+
+            if self.config.flow_solver == "heun":
+                x_pred = x_t + dt * v_t
+                v_next = predict_velocity(x_pred, time + dt)
+            else:
+                v_next = None
+
+            x_t, step_velocity = flow_solver_step(
+                x_t=x_t,
+                v_t=v_t,
+                dt=dt,
+                solver=self.config.flow_solver,
+                v_next=v_next,
+            )
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
-                self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
+                self.rtc_processor.track(time=time, x_t=x_t, v_t=step_velocity)
 
         return x_t
 
