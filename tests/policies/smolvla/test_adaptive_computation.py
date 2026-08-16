@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import deque
+from types import MethodType, SimpleNamespace
+
 import pytest
 import torch
 
@@ -25,6 +28,8 @@ from lerobot.policies.smolvla.adaptive_computation import (
     select_optimal_budget_labels,
 )
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+from lerobot.utils.constants import ACTION
 
 
 def test_masked_mean_pool_ignores_padding():
@@ -124,3 +129,26 @@ def test_smolvla_config_rejects_horizon_larger_than_training_chunk():
             chunk_size=50,
             adaptive_computation=AdaptiveComputationConfig(horizon_choices=(10, 20, 60)),
         )
+
+
+def test_select_action_forwards_runtime_budget_overrides_to_chunk_generation():
+    policy = SmolVLAPolicy.__new__(SmolVLAPolicy)
+    torch.nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(rtc_config=None, n_action_steps=10)
+    policy._queues = {ACTION: deque(maxlen=10)}
+    received_kwargs = {}
+
+    def prepare_batch(self, batch):
+        return batch
+
+    def get_action_chunk(self, batch, noise=None, **kwargs):
+        received_kwargs.update(kwargs)
+        return torch.zeros(1, 10, 7)
+
+    policy._prepare_batch = MethodType(prepare_batch, policy)
+    policy._get_action_chunk = MethodType(get_action_chunk, policy)
+
+    action = policy.select_action({}, action_horizon=10, num_inference_steps=2)
+
+    assert action.shape == (1, 7)
+    assert received_kwargs == {"action_horizon": 10, "num_inference_steps": 2}
