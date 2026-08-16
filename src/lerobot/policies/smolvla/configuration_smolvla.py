@@ -19,6 +19,7 @@ from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import OBS_IMAGES
 
 from ..rtc.configuration_rtc import RTCConfig
+from .adaptive_computation import AdaptiveComputationConfig
 
 
 @PreTrainedConfig.register_subclass("smolvla")
@@ -109,6 +110,10 @@ class SmolVLAConfig(PreTrainedConfig):
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 
+    # Task-adaptive action horizon and Rectified Flow inference budget.
+    # ``None`` preserves the original fixed chunk_size/num_steps behavior.
+    adaptive_computation: AdaptiveComputationConfig | None = None
+
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 
@@ -137,6 +142,18 @@ class SmolVLAConfig(PreTrainedConfig):
             )
         if not 0 <= self.flow_time_eps < 0.5:
             raise ValueError(f"`flow_time_eps` must be in [0, 0.5), got {self.flow_time_eps}.")
+        if self.adaptive_computation is not None and self.adaptive_computation.enabled:
+            self.adaptive_computation.validate_for_policy(self.chunk_size)
+            if self.compile_model:
+                raise ValueError(
+                    "Adaptive computation currently uses dynamic action shapes and cannot be combined "
+                    "with compile_model=True."
+                )
+            if self.rtc_config is not None and self.rtc_config.enabled:
+                raise ValueError(
+                    "Adaptive computation and RTC cannot currently be enabled together because "
+                    "successive adaptive chunks may have different temporal lengths."
+                )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

@@ -12,8 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .adaptive_computation import AdaptiveComputationConfig, AdaptiveComputationController
 from .configuration_smolvla import SmolVLAConfig
 from .modeling_smolvla import SmolVLAPolicy
 from .processor_smolvla import make_smolvla_pre_post_processors
 
-__all__ = ["SmolVLAConfig", "SmolVLAPolicy", "make_smolvla_pre_post_processors"]
+__all__ = [
+    "AdaptiveComputationConfig",
+    "AdaptiveComputationController",
+    "SmolVLAConfig",
+    "SmolVLAPolicy",
+    "make_smolvla_pre_post_processors",
+]

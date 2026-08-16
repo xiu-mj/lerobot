@@ -69,6 +69,13 @@ from ..rtc.modeling_rtc import RTCProcessor
 from ..utils import (
     populate_queues,
 )
+from .adaptive_computation import (
+    ADAPTIVE_HORIZON_LABEL,
+    ADAPTIVE_NUM_STEPS_LABEL,
+    AdaptiveComputationController,
+    AdaptiveComputationOutput,
+    resolve_runtime_budget,
+)
 from .configuration_smolvla import SmolVLAConfig
 from .smolvlm_with_expert import SmolVLMWithExpertModel
 
@@ -77,6 +84,8 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    action_horizon: int | None
+    num_inference_steps: int | None
 
 
 def create_sinusoidal_pos_embedding(
@@ -379,7 +388,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        model_output = self.model.forward(
+            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time
+        )
+        if isinstance(model_output, tuple):
+            losses, adaptive_output = model_output
+        else:
+            losses = model_output
+            adaptive_output = None
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
@@ -393,6 +409,31 @@ class SmolVLAPolicy(PreTrainedPolicy):
         losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
+        adaptive_loss = None
+        if adaptive_output is not None and self.model.adaptive_controller is not None:
+            horizon_labels = batch.get(ADAPTIVE_HORIZON_LABEL)
+            num_steps_labels = batch.get(ADAPTIVE_NUM_STEPS_LABEL)
+            if horizon_labels is not None or num_steps_labels is not None:
+                adaptive_loss, adaptive_terms = self.model.adaptive_controller.supervised_loss(
+                    adaptive_output,
+                    horizon_labels=horizon_labels,
+                    num_steps_labels=num_steps_labels,
+                    reduction="none",
+                )
+                for name, term in adaptive_terms.items():
+                    loss_dict[name] = term.detach().mean().item()
+                if horizon_labels is not None and self.config.adaptive_computation.adapt_horizon:
+                    horizon_labels = horizon_labels.to(adaptive_output.horizons.device).reshape(-1)
+                    loss_dict["adaptive_horizon_accuracy"] = (
+                        (adaptive_output.horizons == horizon_labels).float().mean().item()
+                    )
+                if num_steps_labels is not None and self.config.adaptive_computation.adapt_num_steps:
+                    num_steps_labels = num_steps_labels.to(adaptive_output.num_steps.device).reshape(-1)
+                    loss_dict["adaptive_num_steps_accuracy"] = (
+                        (adaptive_output.num_steps == num_steps_labels).float().mean().item()
+                    )
+            loss_dict["adaptive_difficulty"] = adaptive_output.difficulty.detach().mean().item()
+
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over valid (time, action) entries
             if actions_is_pad is None:
@@ -400,6 +441,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
             else:
                 num_valid = ((~actions_is_pad).sum(dim=1) * losses.shape[-1]).clamp_min(1)
                 per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
+            if adaptive_loss is not None:
+                per_sample_loss = per_sample_loss + adaptive_loss.to(per_sample_loss.dtype)
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
@@ -409,6 +452,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
             else:
                 num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
                 loss = losses.sum() / num_valid
+            if adaptive_loss is not None:
+                loss = loss + adaptive_loss.mean().to(loss.dtype)
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
@@ -500,7 +545,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
         target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
         return {
             "target_modules": target_modules,
-            "modules_to_save": [],
+            "modules_to_save": (
+                ["adaptive_controller"]
+                if self.config.adaptive_computation is not None
+                and self.config.adaptive_computation.enabled
+                else []
+            ),
         }
 
     def _validate_peft_config(self, peft_config) -> None:
@@ -644,6 +694,16 @@ class VLAFlowMatching(nn.Module):
         self.action_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
+        adaptive_config = self.config.adaptive_computation
+        self.adaptive_controller = (
+            AdaptiveComputationController(
+                input_dim=self.vlm_with_expert.config.text_config.hidden_size,
+                config=adaptive_config,
+            )
+            if adaptive_config is not None and adaptive_config.enabled
+            else None
+        )
+        self.last_adaptive_decision: dict[str, Tensor | int] | None = None
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
@@ -820,7 +880,7 @@ class VLAFlowMatching(nn.Module):
         pad_masks.append(action_time_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] * self.config.chunk_size
+        att_masks += [1] * action_time_dim
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
@@ -848,7 +908,7 @@ class VLAFlowMatching(nn.Module):
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
+        (prefix_out, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
@@ -856,11 +916,14 @@ class VLAFlowMatching(nn.Module):
             use_cache=False,
             fill_kv_cache=False,
         )
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        adaptive_output = self._predict_adaptive_budget(prefix_out, prefix_pad_masks)
+        suffix_out = suffix_out[:, -actions.shape[1] :]
         # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
+        if adaptive_output is not None:
+            return losses, adaptive_output
         return losses
 
     def sample_actions(
@@ -877,17 +940,13 @@ class VLAFlowMatching(nn.Module):
         bsize = state.shape[0]
         device = state.device
 
-        if noise is None:
-            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
-            noise = self.sample_noise(actions_shape, device)
-
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         # Compute image and language key value cache
-        _, past_key_values = self.vlm_with_expert.forward(
+        prefix_outputs, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -895,7 +954,44 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
-        num_steps = self.config.num_steps
+        adaptive_output = self._predict_adaptive_budget(prefix_outputs[0], prefix_pad_masks)
+        budget = resolve_runtime_budget(
+            output=adaptive_output,
+            config=self.config.adaptive_computation,
+            default_horizon=self.config.chunk_size,
+            default_num_steps=self.config.num_steps,
+            action_horizon_override=kwargs.get("action_horizon"),
+            num_steps_override=kwargs.get("num_inference_steps"),
+        )
+        action_horizon = budget.action_horizon
+        num_steps = budget.num_steps
+        if noise is None:
+            actions_shape = (bsize, action_horizon, self.config.max_action_dim)
+            noise = self.sample_noise(actions_shape, device)
+        else:
+            if noise.ndim != 3 or noise.shape[0] != bsize:
+                raise ValueError(
+                    "noise must have shape (batch_size, action_horizon, action_dim), "
+                    f"got {noise.shape}."
+                )
+            if noise.shape[1] < action_horizon:
+                raise ValueError(
+                    f"Provided noise contains {noise.shape[1]} action tokens, but the selected "
+                    f"action horizon is {action_horizon}."
+                )
+            noise = noise[:, :action_horizon]
+
+        if adaptive_output is not None:
+            self.last_adaptive_decision = {
+                "predicted_horizons": adaptive_output.horizons.detach().cpu(),
+                "predicted_num_steps": adaptive_output.num_steps.detach().cpu(),
+                "difficulty": adaptive_output.difficulty.detach().cpu(),
+                "selected_horizon": action_horizon,
+                "selected_num_steps": num_steps,
+            }
+        else:
+            self.last_adaptive_decision = None
+
         if self.config.flow_objective == "rectified_flow":
             start_time = 0.0
             dt = 1.0 / num_steps
@@ -954,6 +1050,13 @@ class VLAFlowMatching(nn.Module):
 
         return x_t
 
+    def _predict_adaptive_budget(
+        self, prefix_embs: Tensor, prefix_pad_masks: Tensor
+    ) -> AdaptiveComputationOutput | None:
+        if self.adaptive_controller is None:
+            return None
+        return self.adaptive_controller(prefix_embs, prefix_pad_masks)
+
     def _flow_endpoint_prediction(self, x_t: Tensor, v_t: Tensor, time: float | Tensor) -> Tensor:
         time_tensor = torch.as_tensor(time, device=x_t.device, dtype=x_t.dtype)
         while time_tensor.ndim < x_t.ndim:
@@ -994,7 +1097,7 @@ class VLAFlowMatching(nn.Module):
             fill_kv_cache=False,
         )
         suffix_out = outputs_embeds[1]
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
+        suffix_out = suffix_out[:, -suffix_len:]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         return v_t

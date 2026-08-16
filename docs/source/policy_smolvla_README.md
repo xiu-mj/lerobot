@@ -10,6 +10,13 @@ evaluation, and server-sync commands. See
 [`smolvla_rectified_flow_code_changes.md`](./smolvla_rectified_flow_code_changes.md) for
 the implementation summary.
 
+## Adaptive Chunk and Adaptive Step
+
+The Rectified Flow variant can optionally predict both the generated action horizon and the
+number of flow inference steps from a shared task-context representation. See
+[`smolvla_adaptive_computation.md`](./smolvla_adaptive_computation.md) for configuration,
+offline label construction, controller training, and fixed-budget ablations.
+
 ## Citation
 
 ```bibtex
