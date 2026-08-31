@@ -68,6 +68,16 @@ class SmolVLAConfig(PreTrainedConfig):
     flow_time_beta_beta: float = 1.0
     flow_time_eps: float = 1e-3
 
+    # Training-free ProbeFlow inference. These options are used only when
+    # `flow_solver="probe_euler"`. The minimum schedule is fixed at two steps
+    # because the initial and lookahead velocity evaluations are both reused.
+    probeflow_probe_time: float = 0.5
+    probeflow_epsilon: float = 0.008
+    probeflow_max_steps: int = 4
+    probeflow_step_increment: int = 2
+    probeflow_use_action_horizon: bool = True
+    probeflow_log_every: int = 100
+
     # Attention utils
     use_cache: bool = True
 
@@ -129,14 +139,40 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 f"`flow_objective` must be 'rectified_flow' or 'flow_matching', got {self.flow_objective!r}."
             )
-        if self.flow_solver not in {"euler", "heun"}:
-            raise ValueError(f"`flow_solver` must be 'euler' or 'heun', got {self.flow_solver!r}.")
+        if self.flow_solver not in {"euler", "heun", "probe_euler"}:
+            raise ValueError(
+                f"`flow_solver` must be 'euler', 'heun', or 'probe_euler', got {self.flow_solver!r}."
+            )
         if self.flow_time_sampling not in {"uniform", "beta"}:
             raise ValueError(
                 f"`flow_time_sampling` must be 'uniform' or 'beta', got {self.flow_time_sampling!r}."
             )
         if not 0 <= self.flow_time_eps < 0.5:
             raise ValueError(f"`flow_time_eps` must be in [0, 0.5), got {self.flow_time_eps}.")
+        if not 0 < self.probeflow_probe_time < 1:
+            raise ValueError(
+                f"`probeflow_probe_time` must be in (0, 1), got {self.probeflow_probe_time}."
+            )
+        if self.probeflow_epsilon <= 0:
+            raise ValueError(f"`probeflow_epsilon` must be positive, got {self.probeflow_epsilon}.")
+        if self.probeflow_max_steps < 2:
+            raise ValueError(f"`probeflow_max_steps` must be at least 2, got {self.probeflow_max_steps}.")
+        if self.probeflow_step_increment < 1:
+            raise ValueError(
+                f"`probeflow_step_increment` must be at least 1, got {self.probeflow_step_increment}."
+            )
+        if (self.probeflow_max_steps - 2) % self.probeflow_step_increment != 0:
+            raise ValueError(
+                "`probeflow_max_steps` must be reachable from 2 using `probeflow_step_increment`."
+            )
+        if self.probeflow_log_every < 0:
+            raise ValueError(f"`probeflow_log_every` must be non-negative, got {self.probeflow_log_every}.")
+        if self.flow_solver == "probe_euler" and self.flow_objective != "rectified_flow":
+            raise ValueError("`probe_euler` currently supports only `flow_objective='rectified_flow'`.")
+        if self.flow_solver == "probe_euler" and self.compile_model:
+            raise ValueError(
+                "`probe_euler` uses dynamic control flow and does not support `compile_model=True`."
+            )
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

@@ -10,6 +10,9 @@ evaluation, and server-sync commands. See
 [`smolvla_rectified_flow_code_changes.md`](./smolvla_rectified_flow_code_changes.md) for
 the implementation summary.
 
+Existing Rectified Flow checkpoints can also use training-free, geometry-aware
+adaptive inference. See [`smolvla_probeflow.md`](./smolvla_probeflow.md).
+
 ## Citation
 
 ```bibtex

@@ -798,6 +798,15 @@ def eval_main(cfg: EvalPipelineConfig):
         for task_group, task_group_info in info.items():
             print(f"\nAggregated Metrics for {task_group}:")
             print(task_group_info)
+
+        policy_model = getattr(policy, "model", None)
+        get_probeflow_stats = getattr(policy_model, "get_probeflow_stats", None)
+        if callable(get_probeflow_stats):
+            probeflow_stats = get_probeflow_stats()
+            if probeflow_stats["calls"]:
+                info["probeflow"] = probeflow_stats
+                print("\nProbeFlow Inference Metrics:")
+                print(probeflow_stats)
     # Close all vec envs
     close_envs(envs)
 

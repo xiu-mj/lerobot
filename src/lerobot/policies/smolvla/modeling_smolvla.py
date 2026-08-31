@@ -52,8 +52,10 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 """
 
+import logging
 import math
 from collections import deque
+from collections.abc import Callable
 from typing import TypedDict, Unpack
 
 import torch
@@ -590,6 +592,91 @@ def flow_solver_step(
     return x_t + dt * step_velocity, step_velocity
 
 
+def probeflow_linearity(
+    v_start: Tensor,
+    v_probe: Tensor,
+    action_horizon: int,
+    action_dim: int,
+) -> Tensor:
+    """Return one ProbeFlow cosine-similarity score per batch element.
+
+    SmolVLA pads actions to ``max_action_dim`` and can predict a longer chunk
+    than it executes. Restricting the probe to the executed, real action
+    coordinates prevents unused outputs from dominating the scheduler.
+    """
+    if v_start.shape != v_probe.shape or v_start.ndim != 3:
+        raise ValueError(
+            "ProbeFlow velocities must have the same (batch, horizon, action_dim) shape, "
+            f"got {tuple(v_start.shape)} and {tuple(v_probe.shape)}."
+        )
+    if not 1 <= action_horizon <= v_start.shape[1]:
+        raise ValueError(
+            f"`action_horizon` must be in [1, {v_start.shape[1]}], got {action_horizon}."
+        )
+    if not 1 <= action_dim <= v_start.shape[2]:
+        raise ValueError(f"`action_dim` must be in [1, {v_start.shape[2]}], got {action_dim}.")
+
+    start = v_start[:, :action_horizon, :action_dim].flatten(start_dim=1).float()
+    probe = v_probe[:, :action_horizon, :action_dim].flatten(start_dim=1).float()
+    return F.cosine_similarity(start, probe, dim=1, eps=1e-8)
+
+
+def probeflow_schedule_steps(
+    similarity: Tensor,
+    epsilon: float,
+    max_steps: int,
+    step_increment: int,
+) -> Tensor:
+    """Map ProbeFlow linearity scores to discrete Euler step counts."""
+    if similarity.ndim != 1:
+        raise ValueError(
+            f"ProbeFlow similarity must be one-dimensional, got shape {tuple(similarity.shape)}."
+        )
+    if epsilon <= 0:
+        raise ValueError(f"`epsilon` must be positive, got {epsilon}.")
+    if max_steps < 2:
+        raise ValueError(f"`max_steps` must be at least 2, got {max_steps}.")
+    if step_increment < 1:
+        raise ValueError(f"`step_increment` must be at least 1, got {step_increment}.")
+
+    curvature_bins = torch.floor(torch.clamp(1 - similarity, min=0) / epsilon).to(torch.int64)
+    return torch.clamp(2 + curvature_bins * step_increment, min=2, max=max_steps)
+
+
+def probeflow_euler_sample(
+    noise: Tensor,
+    predict_velocity: Callable[[Tensor, float], Tensor],
+    action_horizon: int,
+    action_dim: int,
+    probe_time: float,
+    epsilon: float,
+    max_steps: int,
+    step_increment: int,
+) -> tuple[Tensor, Tensor, int, int]:
+    """Integrate a Rectified Flow sample with ProbeFlow adaptive Euler steps."""
+    v_start = predict_velocity(noise, 0.0)
+    x_probe = noise + probe_time * v_start
+    v_probe = predict_velocity(x_probe, probe_time)
+    similarity = probeflow_linearity(v_start, v_probe, action_horizon, action_dim)
+    scheduled_steps = probeflow_schedule_steps(similarity, epsilon, max_steps, step_increment)
+
+    # Keep batched inference vectorized by conservatively applying the largest
+    # requested schedule. Batch size one remains exactly per-sample adaptive.
+    selected_steps = int(scheduled_steps.max().item())
+    if selected_steps == 2:
+        return x_probe + (1 - probe_time) * v_probe, similarity, selected_steps, 2
+
+    dense_dt = 1.0 / selected_steps
+    x_t = noise + dense_dt * v_start
+    for step in range(1, selected_steps):
+        time = step * dense_dt
+        v_t = predict_velocity(x_t, time)
+        x_t = x_t + dense_dt * v_t
+
+    # The lookahead evaluation is discarded on the dense path.
+    return x_t, similarity, selected_steps, selected_steps + 1
+
+
 class VLAFlowMatching(nn.Module):
     """
     SmolVLA
@@ -656,6 +743,7 @@ class VLAFlowMatching(nn.Module):
         self.image_end_token = torch.tensor([self.fake_image_token], dtype=torch.long)
         self.prefix_length = self.config.prefix_length
         self.rtc_processor = rtc_processor
+        self.reset_probeflow_stats()
 
         # Compile model if requested
         if config.compile_model:
@@ -665,6 +753,55 @@ class VLAFlowMatching(nn.Module):
 
     def _rtc_enabled(self):
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
+
+    def reset_probeflow_stats(self) -> None:
+        self.last_probeflow_diagnostics: dict[str, float | int | list[float]] | None = None
+        self._probeflow_calls = 0
+        self._probeflow_similarity_sum = 0.0
+        self._probeflow_steps_sum = 0
+        self._probeflow_nfe_sum = 0
+        self._probeflow_step_histogram: dict[int, int] = {}
+
+    def get_probeflow_stats(self) -> dict[str, float | int | dict[int, int]]:
+        calls = self._probeflow_calls
+        return {
+            "calls": calls,
+            "mean_similarity": self._probeflow_similarity_sum / calls if calls else 0.0,
+            "mean_scheduled_steps": self._probeflow_steps_sum / calls if calls else 0.0,
+            "mean_nfe": self._probeflow_nfe_sum / calls if calls else 0.0,
+            "step_histogram": dict(sorted(self._probeflow_step_histogram.items())),
+        }
+
+    def _record_probeflow_stats(self, similarity: Tensor, scheduled_steps: int, nfe: int) -> None:
+        batch_size = similarity.numel()
+        previous_calls = self._probeflow_calls
+        similarity_values = similarity.detach().float().cpu().tolist()
+
+        self.last_probeflow_diagnostics = {
+            "similarity": similarity_values,
+            "scheduled_steps": scheduled_steps,
+            "nfe": nfe,
+        }
+        self._probeflow_calls += batch_size
+        self._probeflow_similarity_sum += sum(similarity_values)
+        self._probeflow_steps_sum += scheduled_steps * batch_size
+        self._probeflow_nfe_sum += nfe * batch_size
+        self._probeflow_step_histogram[scheduled_steps] = (
+            self._probeflow_step_histogram.get(scheduled_steps, 0) + batch_size
+        )
+
+        log_every = self.config.probeflow_log_every
+        if log_every and previous_calls // log_every < self._probeflow_calls // log_every:
+            stats = self.get_probeflow_stats()
+            logging.info(
+                "ProbeFlow stats: calls=%d, mean_similarity=%.6f, mean_steps=%.3f, "
+                "mean_nfe=%.3f, step_histogram=%s",
+                stats["calls"],
+                stats["mean_similarity"],
+                stats["mean_scheduled_steps"],
+                stats["mean_nfe"],
+                stats["step_histogram"],
+            )
 
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
@@ -895,14 +1032,7 @@ class VLAFlowMatching(nn.Module):
             use_cache=self.config.use_cache,
             fill_kv_cache=True,
         )
-        num_steps = self.config.num_steps
-        if self.config.flow_objective == "rectified_flow":
-            start_time = 0.0
-            dt = 1.0 / num_steps
-        else:
-            start_time = 1.0
-            dt = -1.0 / num_steps
-
+        self.last_probeflow_diagnostics = None
         x_t = noise
         inference_delay = kwargs.get("inference_delay")
         prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
@@ -930,6 +1060,35 @@ class VLAFlowMatching(nn.Module):
                     endpoint_prediction_fn=self._flow_endpoint_prediction,
                 )
             return denoise_step_partial_call(input_x_t)
+
+        if self.config.flow_solver == "probe_euler":
+            action_feature = self.config.action_feature
+            action_dim = action_feature.shape[0] if action_feature is not None else self.config.max_action_dim
+            action_horizon = (
+                self.config.n_action_steps
+                if self.config.probeflow_use_action_horizon
+                else self.config.chunk_size
+            )
+            x_t, similarity, selected_steps, nfe = probeflow_euler_sample(
+                noise=noise,
+                predict_velocity=predict_velocity,
+                action_horizon=action_horizon,
+                action_dim=action_dim,
+                probe_time=self.config.probeflow_probe_time,
+                epsilon=self.config.probeflow_epsilon,
+                max_steps=self.config.probeflow_max_steps,
+                step_increment=self.config.probeflow_step_increment,
+            )
+            self._record_probeflow_stats(similarity, selected_steps, nfe)
+            return x_t
+
+        num_steps = self.config.num_steps
+        if self.config.flow_objective == "rectified_flow":
+            start_time = 0.0
+            dt = 1.0 / num_steps
+        else:
+            start_time = 1.0
+            dt = -1.0 / num_steps
 
         for step in range(num_steps):
             time = start_time + step * dt
