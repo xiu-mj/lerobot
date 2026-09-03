@@ -50,6 +50,46 @@ def test_flow_time_sampling_respects_epsilon_bounds():
     assert torch.all(time <= 0.99)
 
 
+def test_golden_flow_time_sampling_respects_bounds_and_has_unique_values():
+    time = sample_flow_time(
+        bsize=256,
+        device=torch.device("cpu"),
+        sampling="golden",
+        beta_alpha=1.5,
+        beta_beta=1.0,
+        eps=0.01,
+    )
+
+    assert time.shape == (256,)
+    assert torch.all(time >= 0.01)
+    assert torch.all(time <= 0.99)
+    assert torch.unique(time).numel() == 256
+
+
+def test_golden_flow_time_sampling_is_reproducible():
+    kwargs = {
+        "bsize": 32,
+        "device": torch.device("cpu"),
+        "sampling": "golden",
+        "beta_alpha": 1.5,
+        "beta_beta": 1.0,
+        "eps": 1e-3,
+    }
+
+    torch.manual_seed(42)
+    time_1 = sample_flow_time(**kwargs)
+    torch.manual_seed(42)
+    time_2 = sample_flow_time(**kwargs)
+
+    assert torch.equal(time_1, time_2)
+
+
+def test_golden_flow_time_sampling_config_is_valid():
+    cfg = SmolVLAConfig(flow_time_sampling="golden")
+
+    assert cfg.flow_time_sampling == "golden"
+
+
 def test_invalid_flow_objective_raises():
     actions = torch.zeros(1, 1, 1)
     noise = torch.ones(1, 1, 1)

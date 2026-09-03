@@ -551,6 +551,17 @@ def sample_flow_time(
     elif sampling == "beta":
         beta_dist = torch.distributions.Beta(concentration1=beta_alpha, concentration0=beta_beta)
         time = beta_dist.sample((bsize,)).to(device=device, dtype=torch.float32)
+    elif sampling == "golden":
+        # A randomized golden-ratio sequence preserves a uniform marginal while
+        # covering the time interval more evenly within each training batch.
+        golden_ratio_conjugate = (math.sqrt(5.0) - 1.0) / 2.0
+        indices = torch.arange(bsize, device=device, dtype=torch.float32)
+        random_shift = torch.rand((), device=device, dtype=torch.float32)
+        time = torch.remainder(random_shift + indices * golden_ratio_conjugate, 1.0)
+
+        # Randomize the assignment between low-discrepancy times and samples so
+        # batch ordering cannot systematically couple a sample to one time region.
+        time = time[torch.randperm(bsize, device=device)]
     else:
         raise ValueError(f"Unsupported flow time sampling strategy: {sampling!r}")
 

@@ -131,9 +131,10 @@ class SmolVLAConfig(PreTrainedConfig):
             )
         if self.flow_solver not in {"euler", "heun"}:
             raise ValueError(f"`flow_solver` must be 'euler' or 'heun', got {self.flow_solver!r}.")
-        if self.flow_time_sampling not in {"uniform", "beta"}:
+        if self.flow_time_sampling not in {"uniform", "beta", "golden"}:
             raise ValueError(
-                f"`flow_time_sampling` must be 'uniform' or 'beta', got {self.flow_time_sampling!r}."
+                "`flow_time_sampling` must be 'uniform', 'beta', or 'golden', "
+                f"got {self.flow_time_sampling!r}."
             )
         if not 0 <= self.flow_time_eps < 0.5:
             raise ValueError(f"`flow_time_eps` must be in [0, 0.5), got {self.flow_time_eps}.")
