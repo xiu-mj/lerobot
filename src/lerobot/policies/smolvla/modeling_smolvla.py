@@ -52,12 +52,14 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 """
 
+import copy
 import math
 from collections import deque
 from typing import TypedDict, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
+from safetensors import safe_open
 from torch import Tensor, nn
 
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
@@ -246,7 +248,65 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.config = config
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
+        self.ema_model = None
+        if self.config.flow_consistency_enabled:
+            self.ema_model = copy.deepcopy(self.model)
+            self.ema_model.requires_grad_(False)
+            self.ema_model.eval()
+            self.register_buffer("_consistency_ema_step", torch.zeros((), dtype=torch.long))
         self.reset()
+
+    @classmethod
+    def _load_as_safetensor(cls, model, model_file: str, map_location: str, strict: bool):
+        """Load checkpoints and initialize EMA when starting from a pre-consistency model."""
+        checkpoint_has_ema = False
+        if model.config.flow_consistency_enabled:
+            with safe_open(model_file, framework="pt") as checkpoint:
+                checkpoint_has_ema = any(key.startswith("ema_model.") for key in checkpoint.keys())
+
+        loaded_model = super()._load_as_safetensor(model, model_file, map_location, strict)
+        if loaded_model.config.flow_consistency_enabled and not checkpoint_has_ema:
+            loaded_model._sync_consistency_ema()
+        return loaded_model
+
+    @torch.no_grad()
+    def _sync_consistency_ema(self) -> None:
+        if self.ema_model is None:
+            return
+        self.ema_model.load_state_dict(self.model.state_dict())
+        self._consistency_ema_step.zero_()
+
+    @torch.no_grad()
+    def update(self) -> None:
+        """Update the consistency teacher after each optimizer step."""
+        if self.ema_model is None:
+            return
+
+        decay = consistency_ema_decay(
+            int(self._consistency_ema_step.item()),
+            power=self.config.flow_consistency_ema_power,
+            max_decay=self.config.flow_consistency_ema_max_decay,
+        )
+        student_state = self.model.state_dict()
+        teacher_state = self.ema_model.state_dict()
+        if student_state.keys() != teacher_state.keys():
+            raise RuntimeError("Student and EMA teacher state dictionaries do not match.")
+
+        for name, teacher_value in teacher_state.items():
+            student_value = student_state[name].detach()
+            if teacher_value.is_floating_point():
+                teacher_value.mul_(decay).add_(student_value, alpha=1.0 - decay)
+            else:
+                teacher_value.copy_(student_value)
+
+        self._consistency_ema_step.add_(1)
+        self.ema_model.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.ema_model is not None:
+            self.ema_model.eval()
+        return self
 
     def reset(self):
         """This should be called whenever the environment is reset."""
@@ -271,7 +331,13 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 model_value.rtc_processor = self.rtc_processor
 
     def get_optim_params(self) -> dict:
-        return self.parameters()
+        # The EMA teacher is part of the policy state so that checkpoints are
+        # resumable, but it must never be handed to the optimizer.
+        return (
+            parameter
+            for name, parameter in self.named_parameters()
+            if not name.startswith("ema_model.")
+        )
 
     def _get_action_chunk(
         self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
@@ -290,7 +356,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        actions = self.model.sample_actions(
+        inference_model = self.model
+        if self.ema_model is not None and self.config.flow_consistency_use_ema_for_inference:
+            inference_model = self.ema_model
+
+        actions = inference_model.sample_actions(
             images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
         )
 
@@ -379,10 +449,21 @@ class SmolVLAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         loss_dict = {}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        losses = self.model.forward(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            noise,
+            time,
+            ema_model=self.ema_model,
+        )
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
+        loss_dict.update(self.model.last_flow_loss_metrics)
 
         if actions_is_pad is not None:
             in_episode_bound = ~actions_is_pad
@@ -495,7 +576,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for SmolVLA fine-tuning."""
         common_projections = (
-            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
+            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out|"
+            "action_target_dt_mlp"
         )
         target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
         return {
@@ -571,6 +653,29 @@ def flow_training_path(actions: Tensor, noise: Tensor, time: Tensor, objective: 
     return x_t, u_t
 
 
+def consistency_velocity_target(
+    x_t: Tensor,
+    x_t_next: Tensor,
+    velocity_next: Tensor,
+    time: Tensor,
+    time_next: Tensor,
+    eps: float = 1e-6,
+) -> Tensor:
+    """Construct ManiFlow's endpoint-based continuous consistency target."""
+    time_expanded = time[:, None, None]
+    time_next_expanded = time_next[:, None, None]
+    predicted_endpoint = x_t_next + (1 - time_next_expanded) * velocity_next
+    return (predicted_endpoint - x_t) / (1 - time_expanded).clamp_min(eps)
+
+
+def consistency_ema_decay(step: int, power: float, max_decay: float) -> float:
+    """EMA warmup schedule used by ManiFlow for short-to-medium training runs."""
+    effective_step = max(0, step - 1)
+    if effective_step <= 0:
+        return 0.0
+    return min(1 - (1 + effective_step) ** (-power), max_decay)
+
+
 def flow_solver_step(
     x_t: Tensor,
     v_t: Tensor,
@@ -644,6 +749,20 @@ class VLAFlowMatching(nn.Module):
         self.action_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
+        self.action_target_dt_mlp = None
+        if self.config.flow_consistency_enabled:
+            hidden_size = self.vlm_with_expert.expert_hidden_size
+            self.action_target_dt_mlp = nn.Sequential(
+                nn.Linear(hidden_size, hidden_size),
+                nn.SiLU(),
+                nn.Linear(hidden_size, hidden_size),
+            )
+            # Preserve the original RF behavior at initialization. The new
+            # conditioning branch starts as an exact zero residual.
+            nn.init.zeros_(self.action_target_dt_mlp[-1].weight)
+            nn.init.zeros_(self.action_target_dt_mlp[-1].bias)
+
+        self.last_flow_loss_metrics: dict[str, float] = {}
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
@@ -784,7 +903,7 @@ class VLAFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions, timestep):
+    def embed_suffix(self, noisy_actions, timestep, target_dt=None):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -812,6 +931,18 @@ class VLAFlowMatching(nn.Module):
         action_time_emb = F.silu(action_time_emb)  # swish == silu
         action_time_emb = self.action_time_mlp_out(action_time_emb)
 
+        if self.action_target_dt_mlp is not None:
+            if target_dt is None:
+                target_dt = torch.zeros_like(timestep)
+            target_dt_emb = create_sinusoidal_pos_embedding(
+                target_dt,
+                self.vlm_with_expert.expert_hidden_size,
+                self.config.min_period,
+                self.config.max_period,
+                device=device,
+            ).to(dtype=dtype)
+            action_time_emb = action_time_emb + self.action_target_dt_mlp(target_dt_emb)[:, None, :]
+
         # Add to input tokens
         embs.append(action_time_emb)
 
@@ -827,21 +958,17 @@ class VLAFlowMatching(nn.Module):
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
         return embs, pad_masks, att_masks
 
-    def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+    def _predict_velocity_from_prefix(
+        self,
+        x_t,
+        time,
+        target_dt,
+        prefix_embs,
+        prefix_pad_masks,
+        prefix_att_masks,
     ) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
-
-        if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
-
-        x_t, u_t = flow_training_path(actions, noise, time, self.config.flow_objective)
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
-        )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
+        """Predict a velocity while reusing already-computed prefix embeddings."""
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time, target_dt)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -857,10 +984,176 @@ class VLAFlowMatching(nn.Module):
             fill_kv_cache=False,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out)
-        losses = F.mse_loss(u_t, v_t, reduction="none")
+        return self.action_out_proj(suffix_out)
+
+    def predict_velocity(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        x_t,
+        time,
+        target_dt=None,
+    ) -> Tensor:
+        """Predict velocity without constructing a training target."""
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        return self._predict_velocity_from_prefix(
+            x_t,
+            time,
+            target_dt,
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+        )
+
+    def _continuous_consistency_batch(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        noise,
+        time,
+        ema_model,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, int]:
+        """Build a mixed RF/continuous-consistency batch and its target velocity."""
+        batch_size = actions.shape[0]
+        if batch_size < 2:
+            raise ValueError("Continuous consistency training requires a batch size of at least 2.")
+        if ema_model is None:
+            raise RuntimeError("Continuous consistency training requires an EMA teacher model.")
+
+        consistency_size = max(1, int(batch_size * self.config.flow_consistency_ratio))
+        consistency_size = min(consistency_size, batch_size - 1)
+        consistency_slice = slice(batch_size - consistency_size, batch_size)
+
+        # ManiFlow samples consistency start times on a coarse grid, then a
+        # continuous positive target step. Keeping the ordinary RF samples
+        # uniform makes this a clean ablation against RF Uniform.
+        num_intervals = self.config.flow_consistency_timesteps
+        grid_index = torch.randint(
+            0,
+            num_intervals,
+            (consistency_size,),
+            device=actions.device,
+        )
+        consistency_time = grid_index.to(dtype=time.dtype) / num_intervals
+        time = time.clone()
+        time[consistency_slice] = consistency_time
+
+        x_t, target_velocity = flow_training_path(actions, noise, time, "rectified_flow")
+        delta_t = torch.rand(consistency_size, device=actions.device, dtype=time.dtype)
+        time_next = torch.clamp(consistency_time + delta_t, max=1.0)
+        x_t_next, _ = flow_training_path(
+            actions[consistency_slice],
+            noise[consistency_slice],
+            time_next,
+            "rectified_flow",
+        )
+
+        with torch.no_grad():
+            velocity_next = ema_model.predict_velocity(
+                [image[consistency_slice] for image in images],
+                [mask[consistency_slice] for mask in img_masks],
+                lang_tokens[consistency_slice],
+                lang_masks[consistency_slice],
+                state[consistency_slice],
+                x_t_next,
+                time_next,
+                target_dt=delta_t,
+            )
+            consistency_target = consistency_velocity_target(
+                x_t[consistency_slice],
+                x_t_next,
+                velocity_next,
+                consistency_time,
+                time_next,
+            )
+
+        target_velocity = target_velocity.clone()
+        target_velocity[consistency_slice] = consistency_target
+        target_dt = torch.zeros_like(time)
+        target_dt[consistency_slice] = delta_t
+        return x_t, target_velocity, time, target_dt, consistency_size
+
+    def forward(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        noise=None,
+        time=None,
+        ema_model=None,
+    ) -> Tensor:
+        """Do a full training forward pass and compute element-wise losses."""
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
+
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
+
+        consistency_size = 0
+        target_dt = None
+        if self.config.flow_consistency_enabled:
+            x_t, target_velocity, time, target_dt, consistency_size = (
+                self._continuous_consistency_batch(
+                    images,
+                    img_masks,
+                    lang_tokens,
+                    lang_masks,
+                    state,
+                    actions,
+                    noise,
+                    time,
+                    ema_model,
+                )
+            )
+        else:
+            x_t, target_velocity = flow_training_path(
+                actions, noise, time, self.config.flow_objective
+            )
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        velocity = self._predict_velocity_from_prefix(
+            x_t,
+            time,
+            target_dt,
+            prefix_embs,
+            prefix_pad_masks,
+            prefix_att_masks,
+        )
+        losses = F.mse_loss(target_velocity, velocity, reduction="none")
+
+        self.last_flow_loss_metrics = {}
+        if consistency_size:
+            flow_size = actions.shape[0] - consistency_size
+            raw_flow_loss = losses[:flow_size].mean()
+            raw_consistency_loss = losses[flow_size:].mean()
+            self.last_flow_loss_metrics = {
+                "loss_rf": raw_flow_loss.detach().item(),
+                "loss_consistency": raw_consistency_loss.detach().item(),
+            }
+
+            # The outer policy averages element-wise losses. Rescale each
+            # subset so this realizes L_rf + lambda * L_consistency rather
+            # than a ratio-weighted convex combination.
+            losses = losses.clone()
+            losses[:flow_size] *= actions.shape[0] / flow_size
+            losses[flow_size:] *= (
+                self.config.flow_consistency_weight * actions.shape[0] / consistency_size
+            )
         return losses
 
     def sample_actions(
@@ -910,6 +1203,7 @@ class VLAFlowMatching(nn.Module):
 
         def predict_velocity(input_x_t: Tensor, time: float) -> Tensor:
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            target_dt = torch.full_like(time_tensor, abs(dt))
 
             def denoise_step_partial_call(denoise_input_x_t):
                 return self.denoise_step(
@@ -917,6 +1211,7 @@ class VLAFlowMatching(nn.Module):
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     timestep=time_tensor,
+                    target_dt=target_dt,
                 )
 
             if self._rtc_enabled():
@@ -970,9 +1265,10 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        target_dt=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep, target_dt)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]

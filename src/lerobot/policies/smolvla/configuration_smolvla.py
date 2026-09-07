@@ -68,6 +68,17 @@ class SmolVLAConfig(PreTrainedConfig):
     flow_time_beta_beta: float = 1.0
     flow_time_eps: float = 1e-3
 
+    # ManiFlow-style continuous-time consistency training. The ordinary
+    # rectified-flow objective remains active for the non-consistency portion
+    # of each batch.
+    flow_consistency_enabled: bool = False
+    flow_consistency_ratio: float = 0.25
+    flow_consistency_weight: float = 1.0
+    flow_consistency_timesteps: int = 10
+    flow_consistency_ema_power: float = 0.75
+    flow_consistency_ema_max_decay: float = 0.9999
+    flow_consistency_use_ema_for_inference: bool = True
+
     # Attention utils
     use_cache: bool = True
 
@@ -137,6 +148,36 @@ class SmolVLAConfig(PreTrainedConfig):
             )
         if not 0 <= self.flow_time_eps < 0.5:
             raise ValueError(f"`flow_time_eps` must be in [0, 0.5), got {self.flow_time_eps}.")
+        if self.flow_consistency_enabled:
+            if self.flow_objective != "rectified_flow":
+                raise ValueError("Continuous consistency training requires `flow_objective='rectified_flow'`.")
+            if not 0 < self.flow_consistency_ratio < 1:
+                raise ValueError(
+                    "`flow_consistency_ratio` must be in (0, 1), "
+                    f"got {self.flow_consistency_ratio}."
+                )
+            if self.flow_consistency_weight < 0:
+                raise ValueError(
+                    "`flow_consistency_weight` must be non-negative, "
+                    f"got {self.flow_consistency_weight}."
+                )
+            if self.flow_consistency_timesteps < 2:
+                raise ValueError(
+                    "`flow_consistency_timesteps` must be at least 2, "
+                    f"got {self.flow_consistency_timesteps}."
+                )
+            if self.flow_consistency_ema_power <= 0:
+                raise ValueError(
+                    "`flow_consistency_ema_power` must be positive, "
+                    f"got {self.flow_consistency_ema_power}."
+                )
+            if not 0 <= self.flow_consistency_ema_max_decay < 1:
+                raise ValueError(
+                    "`flow_consistency_ema_max_decay` must be in [0, 1), "
+                    f"got {self.flow_consistency_ema_max_decay}."
+                )
+            if self.compile_model:
+                raise ValueError("Continuous consistency training does not currently support `compile_model=True`.")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

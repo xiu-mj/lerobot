@@ -2,7 +2,13 @@ import pytest
 import torch
 
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
-from lerobot.policies.smolvla.modeling_smolvla import flow_solver_step, flow_training_path, sample_flow_time
+from lerobot.policies.smolvla.modeling_smolvla import (
+    consistency_ema_decay,
+    consistency_velocity_target,
+    flow_solver_step,
+    flow_training_path,
+    sample_flow_time,
+)
 
 
 def test_smolvla_config_defaults_to_rectified_flow():
@@ -88,3 +94,42 @@ def test_heun_solver_requires_corrector_velocity():
 def test_invalid_flow_solver_config_raises():
     with pytest.raises(ValueError, match="flow_solver"):
         SmolVLAConfig(flow_solver="bad-solver")
+
+
+def test_consistency_velocity_target_uses_teacher_endpoint():
+    x_t = torch.tensor([[[2.0]]])
+    x_t_next = torch.tensor([[[3.0]]])
+    velocity_next = torch.tensor([[[4.0]]])
+    time = torch.tensor([0.25])
+    time_next = torch.tensor([0.5])
+
+    target = consistency_velocity_target(x_t, x_t_next, velocity_next, time, time_next)
+
+    # Teacher endpoint: 3 + (1 - 0.5) * 4 = 5; (5 - 2) / (1 - 0.25) = 4.
+    assert torch.allclose(target, torch.tensor([[[4.0]]]))
+
+
+def test_consistency_ema_decay_warms_up_and_is_capped():
+    assert consistency_ema_decay(step=0, power=0.75, max_decay=0.9999) == 0.0
+    assert 0.0 < consistency_ema_decay(step=10, power=0.75, max_decay=0.9999) < 0.9999
+    assert consistency_ema_decay(step=10**12, power=0.75, max_decay=0.99) == 0.99
+
+
+def test_consistency_config_requires_rectified_flow():
+    with pytest.raises(ValueError, match="rectified_flow"):
+        SmolVLAConfig(flow_objective="flow_matching", flow_consistency_enabled=True)
+
+
+@pytest.mark.parametrize(
+    "override, expected_message",
+    [
+        ({"flow_consistency_ratio": 0.0}, "flow_consistency_ratio"),
+        ({"flow_consistency_weight": -1.0}, "flow_consistency_weight"),
+        ({"flow_consistency_timesteps": 1}, "flow_consistency_timesteps"),
+        ({"flow_consistency_ema_power": 0.0}, "flow_consistency_ema_power"),
+        ({"flow_consistency_ema_max_decay": 1.0}, "flow_consistency_ema_max_decay"),
+    ],
+)
+def test_invalid_consistency_config_raises(override, expected_message):
+    with pytest.raises(ValueError, match=expected_message):
+        SmolVLAConfig(flow_consistency_enabled=True, **override)
