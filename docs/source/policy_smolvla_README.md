@@ -10,6 +10,9 @@ evaluation, and server-sync commands. See
 [`smolvla_rectified_flow_code_changes.md`](./smolvla_rectified_flow_code_changes.md) for
 the implementation summary.
 
+The experimental ManiFlow-style continuous-consistency extension for Rectified Flow is documented in
+[`SMOLVLA_RF_CONTINUOUS_CONSISTENCY.md`](./SMOLVLA_RF_CONTINUOUS_CONSISTENCY.md).
+
 ## Citation
 
 ```bibtex
